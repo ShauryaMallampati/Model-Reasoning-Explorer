@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Artifacts
+backend/runs/
+!backend/runs/.gitkeep
+backend/reports/
+!backend/reports/.gitkeep
+backend/.mre_cache/
+backend/.pytest_cache/
+frontend/.cache/
+
+# Logs
+*.log
+
+# Env
+.env
+.env.*
+
+# Coverage
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/

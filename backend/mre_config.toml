@@ -1,0 +1,22 @@
+[paths]
+base_dir = "../"
+runs_dir = "../backend/runs"
+reports_dir = "../backend/reports"
+safe_model_dir = "../models"
+safe_data_dir = "../sample_data"
+
+[limits]
+max_upload_mb = 20
+max_batch_size = 16
+max_layers = 128
+
+[execution]
+allow_gpu = false
+seed = 42
+
+[models]
+allowlist = [
+  "sshleifer/tiny-gpt2",
+  "distilbert-base-uncased-finetuned-sst-2-english",
+  "resnet18"
+]
