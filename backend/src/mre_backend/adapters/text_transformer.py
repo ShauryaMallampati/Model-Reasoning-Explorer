@@ -11,6 +11,7 @@ from .base import AdapterOutputs, BaseAdapter
 class TextTransformerAdapter(BaseAdapter):
     def __init__(self, task_type: str) -> None:
         self.task_type = task_type
+        self._id2label: dict[int, str] = {}
 
     def load(self, model_id: str, device: torch.device) -> tuple[Any, Any]:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -20,6 +21,7 @@ class TextTransformerAdapter(BaseAdapter):
             model = AutoModelForCausalLM.from_pretrained(model_id)
         else:
             model = AutoModelForSequenceClassification.from_pretrained(model_id)
+            self._id2label = getattr(model.config, "id2label", {}) or {}
         model.to(device)
         model.eval()
         return model, tokenizer
@@ -62,7 +64,7 @@ class TextTransformerAdapter(BaseAdapter):
 
         probs = torch.softmax(outputs.logits, dim=-1)
         values, indices = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
-        id2label = {}
+        id2label = self._id2label or {}
         top = []
         for idx, val in zip(indices[0].tolist(), values[0].tolist()):
             label = id2label.get(idx, str(idx))

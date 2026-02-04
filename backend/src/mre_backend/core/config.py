@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .utils import env_bool
+
 
 class PathConfig(BaseModel):
     base_dir: Path
@@ -96,6 +98,9 @@ def load_settings() -> SettingsBundle:
         execution=ExecutionConfig(**execution),
         models=ModelsConfig(**models),
     )
+
+    # Allow environment override for GPU usage
+    settings.execution.allow_gpu = env_bool("MRE_ALLOW_GPU", settings.execution.allow_gpu)
 
     settings.paths.runs_dir.mkdir(parents=True, exist_ok=True)
     settings.paths.reports_dir.mkdir(parents=True, exist_ok=True)

@@ -23,7 +23,7 @@ class LogitLensAnalyzer(BaseAnalyzer):
         if not hasattr(model, "lm_head"):
             return AnalyzerOutput(summary={"message": "Model missing lm_head"})
 
-        top_k = context.request.options.get("top_k", 5)
+        top_k = context.request.options.top_k
         layer_summaries = []
         for idx, hidden in enumerate(hidden_states):
             logits = model.lm_head(hidden)

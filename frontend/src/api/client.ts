@@ -28,6 +28,11 @@ export async function getRun(runId: string) {
   return res.json();
 }
 
+export async function cancelRun(runId: string) {
+  const res = await fetch(`${API_BASE}/api/run/${runId}/cancel`, { method: "POST" });
+  return res.json();
+}
+
 export async function compareRuns(runA: string, runB: string) {
   const res = await fetch(`${API_BASE}/api/compare`, {
     method: "POST",

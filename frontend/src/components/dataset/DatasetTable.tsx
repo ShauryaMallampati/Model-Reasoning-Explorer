@@ -1,6 +1,6 @@
 import React from "react";
 
-const DatasetTable: React.FC<{ examples: Record<string, string>[] }> = ({ examples }) => {
+const DatasetTable: React.FC<{ examples: Record<string, any>[] }> = ({ examples }) => {
   if (examples.length === 0) {
     return <div className="panel">No examples yet</div>;
   }

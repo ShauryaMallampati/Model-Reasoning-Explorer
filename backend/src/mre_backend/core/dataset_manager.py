@@ -124,6 +124,8 @@ class DatasetManager:
 
         examples = []
         y_true = []
+        y_pred = []
+        confidences = []
         embeddings = []
 
         for row in rows:
@@ -131,7 +133,9 @@ class DatasetManager:
             label = row.get(record.request.label_column, "")
             inputs = adapter.prepare_inputs(tokenizer, {"text": text}, device)
             outputs = adapter.forward(model, inputs, {"hidden_states": True, "attentions": False})
-            pred = int(outputs.logits.argmax(dim=-1).item())
+            probs = torch.softmax(outputs.logits, dim=-1)[0]
+            pred = int(probs.argmax().item())
+            conf = float(probs.max().item())
             y_true.append(label)
             if outputs.hidden_states:
                 last = outputs.hidden_states[-1].mean(dim=1).squeeze(0).detach().cpu().numpy()
@@ -152,18 +156,81 @@ class DatasetManager:
             self.artifact_store.save_outputs(artifacts, outputs_summary)
             self.artifact_store.save_summaries(artifacts, {})
 
+            pred_label = outputs_summary.get("prediction", str(pred))
+            y_pred.append(pred_label)
+            confidences.append(conf)
             examples.append(
                 {
                     "text": text,
                     "label": label,
-                    "prediction": str(pred),
+                    "prediction": pred_label,
+                    "confidence": round(conf, 4),
                     "run_id": run_id,
                 }
             )
 
+        labels = sorted(set(y_true + y_pred))
+        label_to_idx = {label: idx for idx, label in enumerate(labels)}
+        matrix = [[0 for _ in labels] for _ in labels]
+        correct = 0
+        for true, pred in zip(y_true, y_pred):
+            i = label_to_idx.get(true)
+            j = label_to_idx.get(pred)
+            if i is not None and j is not None:
+                matrix[i][j] += 1
+            if true == pred:
+                correct += 1
+
+        accuracy = correct / len(y_true) if y_true else 0.0
+
+        # calibration bins
+        bins = [i / 10 for i in range(11)]
+        bin_counts = [0 for _ in range(10)]
+        bin_conf = [0.0 for _ in range(10)]
+        bin_acc = [0.0 for _ in range(10)]
+        for true, pred, conf in zip(y_true, y_pred, confidences):
+            idx = min(9, int(conf * 10))
+            bin_counts[idx] += 1
+            bin_conf[idx] += conf
+            bin_acc[idx] += 1.0 if true == pred else 0.0
+        avg_conf = []
+        avg_acc = []
+        for i in range(10):
+            if bin_counts[i] == 0:
+                avg_conf.append(0.0)
+                avg_acc.append(0.0)
+            else:
+                avg_conf.append(bin_conf[i] / bin_counts[i])
+                avg_acc.append(bin_acc[i] / bin_counts[i])
+
+        # error slices by label
+        error_by_label = []
+        for label in labels:
+            total = sum(1 for t in y_true if t == label)
+            wrong = sum(1 for t, p in zip(y_true, y_pred) if t == label and p != label)
+            error_by_label.append(
+                {"label": label, "error_rate": (wrong / total) if total else 0.0, "count": total}
+            )
+
+        high_conf_errors = [
+            ex for ex in examples if ex.get("label") != ex.get("prediction") and ex.get("confidence", 0) > 0.8
+        ][:10]
+
         summary = {
             "count": len(rows),
-            "labels": sorted(set(y_true)),
+            "labels": labels,
+            "accuracy": accuracy,
+            "confusion_matrix": {"labels": labels, "matrix": matrix},
+            "calibration": {
+                "bins": bins,
+                "avg_confidence": avg_conf,
+                "avg_accuracy": avg_acc,
+                "counts": bin_counts,
+            },
+            "error_slices": {
+                "by_label": error_by_label,
+                "high_confidence_errors": high_conf_errors,
+            },
         }
         if embeddings:
             X = np.stack(embeddings)
@@ -174,6 +241,13 @@ class DatasetManager:
                 for ex, cid in zip(examples, clusters.tolist()):
                     ex["cluster"] = int(cid)
                 summary["clusters"] = int(k)
+                cluster_summary = []
+                for cid in range(k):
+                    cluster_examples = [ex for ex in examples if ex.get("cluster") == cid][:3]
+                    cluster_summary.append(
+                        {"cluster": cid, "count": sum(1 for ex in examples if ex.get("cluster") == cid), "examples": cluster_examples}
+                    )
+                summary["cluster_summary"] = cluster_summary
 
         return summary, examples
 
@@ -197,7 +271,9 @@ class DatasetManager:
         for img in images:
             inputs = adapter.prepare_inputs(None, {"image_path": img}, device)
             outputs = adapter.forward(model, inputs, {})
-            pred = int(outputs.logits.argmax(dim=-1).item())
+            probs = torch.softmax(outputs.logits, dim=-1)[0]
+            pred = int(probs.argmax().item())
+            conf = float(probs.max().item())
 
             run_id = safe_run_id(prefix="sample")
             artifacts = self.artifact_store.create(run_id)
@@ -214,7 +290,14 @@ class DatasetManager:
             self.artifact_store.save_outputs(artifacts, outputs_summary)
             self.artifact_store.save_summaries(artifacts, {})
 
-            examples.append({"image": str(img), "prediction": str(pred), "run_id": run_id})
+            examples.append(
+                {
+                    "image": str(img),
+                    "prediction": outputs_summary.get("prediction", str(pred)),
+                    "confidence": round(conf, 4),
+                    "run_id": run_id,
+                }
+            )
 
         summary = {"count": len(examples)}
         return summary, examples

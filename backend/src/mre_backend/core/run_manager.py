@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -138,9 +139,18 @@ class RunManager:
 
     def _decode_image(self, request: RunRequest) -> tuple[Image.Image, str | None]:
         if request.input_image_base64:
-            data = base64.b64decode(request.input_image_base64)
+            payload = request.input_image_base64
+            if "," in payload:
+                payload = payload.split(",", 1)[1]
+            max_bytes = self.settings.limits.max_upload_mb * 1024 * 1024
+            estimated = (len(payload) * 3) // 4
+            if estimated > max_bytes:
+                raise ValueError("Image payload too large")
+            data = base64.b64decode(payload)
+            if len(data) > max_bytes:
+                raise ValueError("Image payload too large")
             image = Image.open(io.BytesIO(data)).convert("RGB")
-            return image, request.input_image_base64
+            return image, payload
         if request.input_image_path:
             path = Path(request.input_image_path)
             if not path.is_absolute():
@@ -167,6 +177,9 @@ class RunManager:
             self.artifact_store.append_log(artifacts, message)
             self._broadcast(run_id, {"type": "log", "message": message})
 
+        def progress(value: int, stage: str) -> None:
+            self._broadcast(run_id, {"type": "progress", "value": value, "stage": stage})
+
         def check_cancel() -> None:
             if record.cancel_event and record.cancel_event.is_set():
                 raise RuntimeError("Run cancelled")
@@ -179,6 +192,7 @@ class RunManager:
             seed = record.request.options.seed or self.settings.execution.seed
             set_seed(seed)
             log("Validated request and set seed")
+            progress(10, "validated")
 
             device = torch.device("cpu")
             if self.settings.execution.allow_gpu and torch.cuda.is_available():
@@ -202,6 +216,7 @@ class RunManager:
                         model_id=record.request.model_id,
                     ),
                 )
+            progress(20, "model_loaded")
 
             image_preview = None
             raw_input: dict[str, Any] = {}
@@ -214,6 +229,7 @@ class RunManager:
             log("Preparing inputs")
             inputs = adapter.prepare_inputs(tokenizer, raw_input, device)
             check_cancel()
+            progress(30, "inputs_ready")
 
             capture_opts = {
                 "gradients": record.request.options.capture.gradients,
@@ -230,6 +246,7 @@ class RunManager:
             log("Running forward pass")
             outputs = adapter.forward(model, inputs, capture_opts)
             check_cancel()
+            progress(50, "forward_done")
 
             if record.request.options.capture.gradients:
                 if record.request.task_type == "text_lm":
@@ -291,8 +308,24 @@ class RunManager:
                     if output.arrays:
                         path = self.artifact_store.save_arrays(artifacts, analyzer.id, output.arrays)
                         arrays_saved.append(path.name)
+            progress(75, "analyzers_done")
 
             log("Saving artifacts")
+            if record.request.options.capture.logits and outputs.hidden_states and hasattr(model, "lm_head"):
+                values_list = []
+                indices_list = []
+                for hidden in outputs.hidden_states:
+                    logits = model.lm_head(hidden)
+                    last_logits = logits[:, -1, :]
+                    vals, idxs = torch.topk(last_logits, k=record.request.options.top_k, dim=-1)
+                    values_list.append(vals.detach().cpu().numpy())
+                    indices_list.append(idxs.detach().cpu().numpy())
+                arrays = {
+                    "values": np.stack(values_list),
+                    "indices": np.stack(indices_list),
+                }
+                path = self.artifact_store.save_arrays(artifacts, "logits_topk", arrays)
+                arrays_saved.append(path.name)
             if record.request.options.capture.hidden_states and outputs.hidden_states:
                 hs_arrays = {
                     f"layer_{i}": h.detach().cpu().numpy() for i, h in enumerate(outputs.hidden_states)
@@ -315,6 +348,19 @@ class RunManager:
                 if act_arrays:
                     path = self.artifact_store.save_arrays(artifacts, "activations", act_arrays)
                     arrays_saved.append(path.name)
+                    stats = []
+                    for name, tensor in capture_store.activations.items():
+                        stats.append(
+                            {
+                                "layer": name,
+                                "mean_abs": float(tensor.abs().mean().item()),
+                            }
+                        )
+                    stats_sorted = sorted(stats, key=lambda x: x["mean_abs"], reverse=True)
+                    summaries["activation_stats"] = {
+                        "layers": stats,
+                        "top_layers": stats_sorted[:10],
+                    }
             if record.request.options.capture.gradients:
                 grad_arrays = {
                     k.replace(".", "_"): v.numpy() for k, v in capture_store.gradients.items()
@@ -338,6 +384,7 @@ class RunManager:
             self.artifact_store.save_metadata(artifacts, metadata)
             self.artifact_store.save_outputs(artifacts, output_summary)
             self.artifact_store.save_summaries(artifacts, summaries)
+            progress(95, "artifacts_saved")
 
             record.status = "completed"
             record.outputs = output_summary
@@ -347,6 +394,7 @@ class RunManager:
 
             log("Run completed")
             self._broadcast(run_id, {"type": "status", "status": "completed", "run_id": run_id})
+            progress(100, "completed")
 
         except Exception as exc:
             record.status = "failed"

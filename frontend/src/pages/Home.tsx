@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import Editor from "react-simple-code-editor";
 import Prism from "prismjs";
 import "prismjs/components/prism-markdown";
-import { listModels, startRun } from "../api/client";
+import { cancelRun, listModels, startRun } from "../api/client";
 import LogsPanel from "../components/run/LogsPanel";
 import Spinner from "../components/common/Spinner";
 import { useRunStore } from "../state/store";
@@ -17,11 +17,13 @@ const Home: React.FC = () => {
   const [captureActivations, setCaptureActivations] = useState(true);
   const [captureGradients, setCaptureGradients] = useState(false);
   const [captureAttention, setCaptureAttention] = useState(true);
+  const [captureLogits, setCaptureLogits] = useState(false);
   const [layerMode, setLayerMode] = useState("all");
   const [layerStride, setLayerStride] = useState(2);
   const [layerList, setLayerList] = useState("");
 
   const runId = useRunStore((s) => s.runId);
+  const status = useRunStore((s) => s.status);
   const setRunId = useRunStore((s) => s.setRunId);
   const clear = useRunStore((s) => s.clear);
 
@@ -34,6 +36,17 @@ const Home: React.FC = () => {
       }
     });
   }, []);
+
+  useEffect(() => {
+    const match = models.find((m) => m.task_type === taskType);
+    if (match) setModelId(match.id);
+  }, [taskType, models]);
+
+  useEffect(() => {
+    if (taskType === "image_classification") {
+      setCaptureGradients(true);
+    }
+  }, [taskType]);
 
   const handleImageUpload = (file: File) => {
     const reader = new FileReader();
@@ -56,6 +69,7 @@ const Home: React.FC = () => {
           activations: captureActivations,
           gradients: captureGradients,
           attentions: captureAttention,
+          logits: captureLogits,
           layers: {
             mode: layerMode,
             stride: layerStride,
@@ -72,6 +86,11 @@ const Home: React.FC = () => {
     const res = await startRun(payload);
     setRunId(res.run_id);
     setLoading(false);
+  };
+
+  const cancel = async () => {
+    if (!runId) return;
+    await cancelRun(runId);
   };
 
   return (
@@ -140,7 +159,7 @@ const Home: React.FC = () => {
               checked={captureGradients}
               onChange={(e) => setCaptureGradients(e.target.checked)}
             />
-            Capture gradients (slow)
+            Capture gradients (required for Grad-CAM)
           </label>
           <label className="checkbox">
             <input
@@ -150,7 +169,18 @@ const Home: React.FC = () => {
             />
             Capture attention
           </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={captureLogits}
+              onChange={(e) => setCaptureLogits(e.target.checked)}
+            />
+            Capture logits per layer
+          </label>
         </div>
+        {taskType === "image_classification" && !captureGradients && (
+          <p className="hint">Grad-CAM requires gradients to be enabled.</p>
+        )}
 
 
         <div className="panel" style={{ marginTop: 16 }}>
@@ -188,6 +218,11 @@ const Home: React.FC = () => {
           <button className="primary" onClick={run} disabled={loading}>
             {loading ? "Running..." : "Run"}
           </button>
+          {runId && status === "running" && (
+            <button className="secondary" onClick={cancel}>
+              Cancel
+            </button>
+          )}
           {loading && <Spinner />}
           {runId && <span className="hint">Run ID: {runId}</span>}
         </div>

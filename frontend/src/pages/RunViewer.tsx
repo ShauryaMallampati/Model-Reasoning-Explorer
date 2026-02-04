@@ -16,6 +16,7 @@ const RunViewer: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState("overview");
   const [reportPath, setReportPath] = useState<string | null>(null);
+  const [attrMethod, setAttrMethod] = useState("integrated_gradients");
 
   useEffect(() => {
     if (!runId) return;
@@ -25,6 +26,15 @@ const RunViewer: React.FC = () => {
       setLoading(false);
     });
   }, [runId]);
+
+  useEffect(() => {
+    if (!data?.metadata?.task_type) return;
+    if (data.metadata.task_type.startsWith("text")) {
+      setAttrMethod("integrated_gradients");
+    } else {
+      setAttrMethod("grad_cam");
+    }
+  }, [data?.metadata?.task_type]);
 
   useEffect(() => {
     if (!runId) return;
@@ -52,21 +62,44 @@ const RunViewer: React.FC = () => {
     const text = data?.metadata?.input_text as string | undefined;
     if (!text) return [];
     return text.split(/\s+/);
-  }, [data]);
+  }, [data, attrMethod]);
 
   const attributionScores = useMemo(() => {
-    const ig = data?.summaries?.integrated_gradients;
-    return ig?.attribution_preview ?? [];
+    if (!data) return [];
+    if (attrMethod === "attention_rollout") {
+      return data?.summaries?.attention_rollout?.rollout_preview ?? [];
+    }
+    return data?.summaries?.integrated_gradients?.attribution_preview ?? [];
   }, [data]);
+
+  const imageHeatmap = useMemo(() => {
+    if (!data) return undefined;
+    if (attrMethod === "grad_cam") return data?.summaries?.grad_cam?.heatmap_preview;
+    if (attrMethod === "occlusion") return data?.summaries?.occlusion?.heatmap_preview;
+    return data?.summaries?.integrated_gradients?.heatmap_preview;
+  }, [data, attrMethod]);
 
   const layerValues = useMemo(() => {
     const logitLens = data?.summaries?.logit_lens?.layers || [];
-    return logitLens.map((layer: any) => layer.top_k?.[0]?.prob ?? 0);
+    if (logitLens.length > 0) {
+      return logitLens.map((layer: any) => layer.top_k?.[0]?.prob ?? 0);
+    }
+    const stats = data?.summaries?.activation_stats?.layers || [];
+    return stats.map((layer: any) => layer.mean_abs ?? 0);
+  }, [data]);
+
+  const layerLabel = useMemo(() => {
+    const logitLens = data?.summaries?.logit_lens?.layers || [];
+    return logitLens.length > 0 ? "Logit Lens Top-1" : "Activation Norms";
   }, [data]);
 
   const neuronList = useMemo(() => {
     const patch = data?.summaries?.activation_patching?.results || [];
-    return patch.map((r: any) => ({ name: `layer_${r.layer}`, value: r.delta_prob ?? 0 }));
+    if (patch.length > 0) {
+      return patch.map((r: any) => ({ name: `layer_${r.layer}`, value: r.delta_prob ?? 0 }));
+    }
+    const stats = data?.summaries?.activation_stats?.top_layers || [];
+    return stats.map((s: any) => ({ name: s.layer, value: s.mean_abs ?? 0 }));
   }, [data]);
 
   if (loading) {
@@ -111,14 +144,29 @@ const RunViewer: React.FC = () => {
           {data.metadata?.task_type?.startsWith("text") ? (
             <section className="panel">
               <h3>Token Attribution</h3>
+              <div className="row">
+                <label className="hint">Method</label>
+                <select value={attrMethod} onChange={(e) => setAttrMethod(e.target.value)}>
+                  <option value="integrated_gradients">Integrated Gradients</option>
+                  <option value="attention_rollout">Attention Rollout</option>
+                </select>
+              </div>
               <AttributionText tokens={tokens} scores={attributionScores} />
             </section>
           ) : (
             <section className="panel">
               <h3>Image Attribution</h3>
+              <div className="row">
+                <label className="hint">Method</label>
+                <select value={attrMethod} onChange={(e) => setAttrMethod(e.target.value)}>
+                  <option value="grad_cam">Grad-CAM</option>
+                  <option value="occlusion">Occlusion</option>
+                  <option value="integrated_gradients">Integrated Gradients</option>
+                </select>
+              </div>
               <AttributionImage
                 imageUrl={data.metadata?.input_image_preview ? `data:image/png;base64,${data.metadata.input_image_preview}` : undefined}
-                heatmap={data.summaries?.grad_cam?.heatmap_preview || data.summaries?.occlusion?.heatmap_preview}
+                heatmap={imageHeatmap}
               />
             </section>
           )}
@@ -130,7 +178,7 @@ const RunViewer: React.FC = () => {
       )}
 
       {tab === "layers" && (
-        <LayerTimeline values={layerValues} label="Logit Lens Top-1" />
+        <LayerTimeline values={layerValues} label={layerLabel} />
       )}
 
       {tab === "neurons" && (
@@ -142,6 +190,7 @@ const RunViewer: React.FC = () => {
           originalText={data.metadata?.input_text}
           modelId={data.metadata?.model_id}
           taskType={data.metadata?.task_type}
+          imagePreview={data.metadata?.input_image_preview}
           onNewRun={(id) => navigate(`/runs/${id}`)}
         />
       )}

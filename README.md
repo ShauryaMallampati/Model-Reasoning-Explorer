@@ -52,6 +52,13 @@ make dev
 ./scripts/demo_vision.sh
 ```
 
+## CLI
+Export a report:
+
+```bash
+mre export --run-id <id>
+```
+
 ## Configuration
 MRE reads configuration from `backend/mre_config.toml`. You can override values with environment variables.
 

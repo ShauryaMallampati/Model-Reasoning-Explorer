@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from typing import Any
-
-import numpy as np
 import torch
 
 from .base import AnalyzerOutput, BaseAnalyzer
@@ -15,7 +13,7 @@ class ActivationPatchingAnalyzer(BaseAnalyzer):
         return task_type == "text_lm"
 
     def run(self, context: Any) -> AnalyzerOutput:
-        counterfactual = context.request.options.get("counterfactual_text")
+        counterfactual = context.request.options.counterfactual_text
         if not counterfactual:
             return AnalyzerOutput(summary={"message": "No counterfactual_text provided"})
 
@@ -41,7 +39,7 @@ class ActivationPatchingAnalyzer(BaseAnalyzer):
 
         layer_modules = list(model.transformer.h)
         total_layers = len(layer_modules)
-        selection = context.request.options.get("patch_layers")
+        selection = context.request.options.patch_layers
         if not selection:
             selection = list(range(max(0, total_layers - 4), total_layers))
 

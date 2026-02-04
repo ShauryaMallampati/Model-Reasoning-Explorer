@@ -6,7 +6,6 @@ import uvicorn
 from mre_backend.api.schemas import RunRequest, RunOptions
 from mre_backend.core.config import load_settings
 from mre_backend.core.artifacts import ArtifactStore
-from mre_backend.core.dataset_manager import DatasetManager
 from mre_backend.core.run_manager import RunManager
 from mre_backend.core.ws import WsManager
 from mre_backend.export_report import export_report
@@ -21,7 +20,7 @@ def serve(host: str = "0.0.0.0", port: int = 8000):
 
 
 @app.command()
-def export(run_id: str):
+def export(run_id: str = typer.Option(..., "--run-id")):
     """Export a static HTML report for a run."""
     settings_bundle = load_settings()
     settings = settings_bundle.settings

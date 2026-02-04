@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+import numpy as np
 
 from mre_backend.api.schemas import (
     CompareRequest,
@@ -99,11 +100,12 @@ async def compare_runs(request: Request, payload: CompareRequest) -> CompareResp
         if not run_dir.exists():
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         outputs = json.loads((run_dir / "outputs.json").read_text())
+        metadata = json.loads((run_dir / "metadata.json").read_text()) if (run_dir / "metadata.json").exists() else {}
         summaries = {}
         summaries_path = run_dir / "summaries.json"
         if summaries_path.exists():
             summaries = json.loads(summaries_path.read_text())
-        return {"outputs": outputs, "summaries": summaries}
+        return {"outputs": outputs, "summaries": summaries, "metadata": metadata, "run_dir": run_dir}
 
     a = load(payload.run_a)
     b = load(payload.run_b)
@@ -115,6 +117,8 @@ async def compare_runs(request: Request, payload: CompareRequest) -> CompareResp
         "prediction_b": b["outputs"].get("prediction"),
         "top_k_a": a["outputs"].get("top_k", []),
         "top_k_b": b["outputs"].get("top_k", []),
+        "generated_a": a["outputs"].get("generated_text"),
+        "generated_b": b["outputs"].get("generated_text"),
     }
 
     logit_lens_a = a["summaries"].get("logit_lens")
@@ -137,6 +141,74 @@ async def compare_runs(request: Request, payload: CompareRequest) -> CompareResp
             "deltas": deltas,
             "pinpoint_layer": max_idx,
         }
+
+    def load_npz(run_dir: Path, name: str):
+        path = run_dir / f"arrays_{name}.npz"
+        if not path.exists():
+            return None
+        return np.load(path)
+
+    def layer_key(name: str):
+        parts = name.split("_")
+        if parts[-1].isdigit():
+            return int(parts[-1])
+        return name
+
+    # Layerwise similarity using hidden states
+    hs_a = load_npz(a["run_dir"], "hidden_states")
+    hs_b = load_npz(b["run_dir"], "hidden_states")
+    if hs_a is not None and hs_b is not None:
+        layers = sorted(set(hs_a.files) & set(hs_b.files), key=layer_key)
+        sims = []
+        for layer in layers:
+            va = hs_a[layer]
+            vb = hs_b[layer]
+            # mean over batch/seq
+            va_mean = va.mean(axis=tuple(range(va.ndim - 1)))
+            vb_mean = vb.mean(axis=tuple(range(vb.ndim - 1)))
+            denom = (np.linalg.norm(va_mean) * np.linalg.norm(vb_mean)) or 1.0
+            sim = float(np.dot(va_mean, vb_mean) / denom)
+            sims.append(sim)
+        if sims:
+            min_idx = int(np.argmin(sims))
+        else:
+            min_idx = None
+        summary["layer_similarity"] = {"layers": layers, "values": sims, "pinpoint_layer": min_idx}
+
+    # Attention delta
+    att_a = load_npz(a["run_dir"], "attentions")
+    att_b = load_npz(b["run_dir"], "attentions")
+    if att_a is not None and att_b is not None:
+        layers = sorted(set(att_a.files) & set(att_b.files), key=layer_key)
+        deltas = []
+        for layer in layers:
+            va = att_a[layer]
+            vb = att_b[layer]
+            deltas.append(float(np.mean(np.abs(va - vb))))
+        summary["attention_delta"] = {"layers": layers, "values": deltas}
+
+    # Attribution diff (text or image)
+    ig_a = load_npz(a["run_dir"], "integrated_gradients")
+    ig_b = load_npz(b["run_dir"], "integrated_gradients")
+    if ig_a is not None and ig_b is not None and "attribution" in ig_a and "attribution" in ig_b:
+        arr_a = ig_a["attribution"]
+        arr_b = ig_b["attribution"]
+        if arr_a.ndim == 1:
+            diff = arr_a - arr_b
+            preview = diff[: min(64, diff.shape[0])].tolist()
+            summary["attribution_diff"] = {"type": "text", "preview": preview}
+        else:
+            diff = arr_a - arr_b
+            # downsample for preview
+            preview = diff[:: max(1, diff.shape[0] // 16), :: max(1, diff.shape[1] // 16)].tolist()
+            summary["attribution_diff"] = {"type": "image", "preview": preview}
+    else:
+        cam_a = load_npz(a["run_dir"], "grad_cam") or load_npz(a["run_dir"], "occlusion")
+        cam_b = load_npz(b["run_dir"], "grad_cam") or load_npz(b["run_dir"], "occlusion")
+        if cam_a is not None and cam_b is not None and "heatmap" in cam_a and "heatmap" in cam_b:
+            diff = cam_a["heatmap"] - cam_b["heatmap"]
+            preview = diff[:: max(1, diff.shape[0] // 16), :: max(1, diff.shape[1] // 16)].tolist()
+            summary["attribution_diff"] = {"type": "image", "preview": preview}
 
     return CompareResponse(summary=summary)
 
