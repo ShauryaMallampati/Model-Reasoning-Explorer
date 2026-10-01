@@ -6,7 +6,7 @@ readme = {text = "Python backend and CLI for Model Reasoning Explorer. See the r
 requires-python = ">=3.11,<3.14"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{name = "MRE Contributors"}]
+authors = [{name = "Shaurya Mallampati"}]
 
 dependencies = [
   "fastapi>=0.111.0",

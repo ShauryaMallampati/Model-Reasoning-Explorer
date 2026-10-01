@@ -19,6 +19,13 @@ The React/TypeScript UI submits requests to FastAPI. A run manager loads an allo
 
 Models and inputs stay on the local machine after model downloads. No hosted inference API or API key is required. Run and report files may contain your original inputs; keep them private.
 
+## Engineering decisions
+
+- **Make unsupported comparisons explicit:** runs with incompatible inputs or tensor shapes report that limitation rather than inventing a difference.
+- **Preserve model-native structure:** token attribution uses recorded tokenizer output, while transformer hooks distinguish hidden states from attention tensors.
+- **Constrain local artifacts:** model choices are allowlisted, run paths stay inside configured directories, and exported reports escape untrusted content.
+- **Use one execution path:** the UI and CLI share the same run manager so saved artifacts, errors, and analyzers are exercised consistently.
+
 ## Quick start
 
 Requires **Python 3.11–3.13** and **Node.js 22.13+ in the 22.x series, or Node.js 24.x**. CPU execution is the default. The first model run downloads public weights from Hugging Face or Torchvision; download time and memory use depend on the selected model.
