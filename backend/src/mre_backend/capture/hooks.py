@@ -34,8 +34,19 @@ class HookManager:
 
     def _make_forward_hook(self, name: str):
         def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
-            # Transformer blocks often return (hidden_states, cache, ...).
-            tensor = output[0] if isinstance(output, (tuple, list)) and output else output
+            tensor = output
+            if isinstance(output, (tuple, list)):
+                # GPT-2 returns hidden states first; attention-enabled DistilBERT
+                # returns (attention, hidden states). Both hidden outputs have
+                # shape (batch, tokens, width); attention matrices have rank four.
+                tensor = next(
+                    (
+                        value
+                        for value in output
+                        if isinstance(value, torch.Tensor) and value.ndim == 3
+                    ),
+                    output[0] if output else None,
+                )
             if not isinstance(tensor, torch.Tensor):
                 return
             # Clone so later in-place activations cannot change recorded values.
