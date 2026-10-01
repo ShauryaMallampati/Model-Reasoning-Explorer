@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { startRun } from "../../api/client";
+import type { RunRequest } from "../../api/client";
 
 type CounterfactualPanelProps = {
   originalText?: string;
@@ -18,6 +19,8 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
 }) => {
   const [text, setText] = useState(originalText || "");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { setText(originalText || ""); }, [originalText]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [rect, setRect] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -42,6 +45,19 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
     img.src = `data:image/png;base64,${imagePreview}`;
   }, [imagePreview, rect]);
 
+  const submit = async (payload: RunRequest) => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await startRun(payload);
+      onNewRun?.(res.run_id);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Run failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const rerun = async () => {
     if (!modelId || !taskType) return;
     setBusy(true);
@@ -54,9 +70,7 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
         counterfactual_text: text
       }
     };
-    const res = await startRun(payload);
-    setBusy(false);
-    onNewRun?.(res.run_id);
+    await submit(payload);
   };
 
   const searchFlip = async () => {
@@ -71,9 +85,7 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
         counterfactual_text: text
       }
     };
-    const res = await startRun(payload);
-    setBusy(false);
-    onNewRun?.(res.run_id);
+    await submit(payload);
   };
 
   const occludeAndRerun = async () => {
@@ -85,9 +97,13 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
       canvas.width = img.width;
       canvas.height = img.height;
       const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (!ctx) {
+        setBusy(false);
+        setError("Canvas is unavailable");
+        return;
+      }
       ctx.drawImage(img, 0, 0);
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillStyle = "black";
       ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
       const dataUrl = canvas.toDataURL("image/png");
       const base64 = dataUrl.split(",")[1];
@@ -96,13 +112,13 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
         model_id: modelId,
         input_image_base64: base64,
         options: {
+          capture: { gradients: true },
           analyzers: ["occlusion", "grad_cam", "integrated_gradients"]
         }
       };
-      const res = await startRun(payload);
-      setBusy(false);
-      onNewRun?.(res.run_id);
+      await submit(payload);
     };
+    img.onerror = () => { setBusy(false); setError("Image could not be loaded"); };
     img.src = `data:image/png;base64,${imagePreview}`;
   };
 
@@ -143,10 +159,12 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
   return (
     <section className="panel">
       <h3>Counterfactual Sandbox</h3>
+      {error && <p role="alert">{error}</p>}
       {taskType !== "image_classification" && (
         <>
           <textarea
             className="textarea"
+            aria-label="Edited input"
             rows={4}
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -155,9 +173,10 @@ const CounterfactualPanel: React.FC<CounterfactualPanelProps> = ({
             <button className="primary" onClick={rerun} disabled={busy}>
               {busy ? "Running..." : "Rerun"}
             </button>
-            <button className="secondary" onClick={searchFlip} disabled={busy}>
-              Minimal Flip Search
-            </button>
+            {taskType === "text_classification" &&
+              <button className="secondary" onClick={searchFlip} disabled={busy}>
+                One-token deletion search
+              </button>}
             <span className="hint">Edit input and rerun to validate changes</span>
           </div>
         </>

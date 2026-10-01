@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import threading
@@ -24,11 +23,18 @@ from mre_backend.analyzers import (
     LogitLensAnalyzer,
     OcclusionAnalyzer,
 )
+from mre_backend.analyzers.logit_lens import project_gpt2_states
 from mre_backend.api.schemas import RunRequest
 from mre_backend.capture.hooks import CaptureStore, HookManager
 from mre_backend.core.artifacts import ArtifactStore
-from mre_backend.core.model_cache import CachedModel, ModelCache
-from mre_backend.core.utils import require_safe_path, safe_run_id, set_seed, utc_now_iso
+from mre_backend.core.model_cache import INFERENCE_LOCK, CachedModel, ModelCache
+from mre_backend.core.utils import (
+    require_safe_path,
+    resolve_model_id,
+    safe_run_id,
+    set_seed,
+    utc_now_iso,
+)
 
 
 @dataclass
@@ -65,7 +71,7 @@ class RunManager:
         self.artifact_store = artifact_store
         self.ws_manager = ws_manager
         self.model_cache = ModelCache()
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=1)
         self._runs: dict[str, RunRecord] = {}
         self._lock = threading.Lock()
         self._analyzers = [
@@ -126,16 +132,8 @@ class RunManager:
             return VisionResNetAdapter()
         raise ValueError(f"Unknown task type: {task_type}")
 
-    def _validate_model(self, model_id: str) -> None:
-        allowlist = set(self.settings.models.allowlist)
-        if model_id in allowlist:
-            return
-        model_path = Path(model_id)
-        if not model_path.is_absolute():
-            model_path = self.settings.paths.safe_model_dir / model_path
-        require_safe_path(model_path, self.settings.paths.safe_model_dir)
-        if not model_path.exists():
-            raise ValueError("Model path not found")
+    def _validate_model(self, model_id: str) -> str:
+        return resolve_model_id(model_id, self.settings)
 
     def _decode_image(self, request: RunRequest) -> tuple[Image.Image, str | None]:
         if request.input_image_base64:
@@ -146,17 +144,27 @@ class RunManager:
             estimated = (len(payload) * 3) // 4
             if estimated > max_bytes:
                 raise ValueError("Image payload too large")
-            data = base64.b64decode(payload)
+            data = base64.b64decode(payload, validate=True)
             if len(data) > max_bytes:
                 raise ValueError("Image payload too large")
-            image = Image.open(io.BytesIO(data)).convert("RGB")
-            return image, payload
+            with Image.open(io.BytesIO(data)) as source:
+                if source.width * source.height > 16_000_000:
+                    raise ValueError("Image resolution exceeds 16 million pixels")
+                image = source.convert("RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return image, base64.b64encode(buffer.getvalue()).decode("ascii")
         if request.input_image_path:
             path = Path(request.input_image_path)
             if not path.is_absolute():
                 path = self.settings.paths.safe_data_dir / path
-            require_safe_path(path, self.settings.paths.safe_data_dir)
-            image = Image.open(path).convert("RGB")
+            path = require_safe_path(path, self.settings.paths.safe_data_dir)
+            if path.stat().st_size > self.settings.limits.max_upload_mb * 1024**2:
+                raise ValueError("Image file too large")
+            with Image.open(path) as source:
+                if source.width * source.height > 16_000_000:
+                    raise ValueError("Image resolution exceeds 16 million pixels")
+                image = source.convert("RGB")
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
             preview = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -164,14 +172,17 @@ class RunManager:
         raise ValueError("Image input required")
 
     def _broadcast(self, run_id: str, event: dict[str, Any]) -> None:
-        try:
-            asyncio.run(self.ws_manager.broadcast(run_id, event))
-        except RuntimeError:
-            pass
+        self.ws_manager.publish(run_id, event)
 
     def _run_task(self, record: RunRecord) -> None:
+        with INFERENCE_LOCK:
+            self._run_task_serial(record)
+
+    def _run_task_serial(self, record: RunRecord) -> None:
         run_id = record.run_id
         artifacts = self.artifact_store.create(run_id)
+        hook_manager = None
+        model = None
 
         def log(message: str) -> None:
             self.artifact_store.append_log(artifacts, message)
@@ -188,8 +199,11 @@ class RunManager:
             record.status = "running"
             record.updated_at = utc_now_iso()
 
-            self._validate_model(record.request.model_id)
-            seed = record.request.options.seed or self.settings.execution.seed
+            check_cancel()
+            resolved_model = self._validate_model(record.request.model_id)
+            seed = record.request.options.seed
+            if seed is None:
+                seed = self.settings.execution.seed
             set_seed(seed)
             log("Validated request and set seed")
             progress(10, "validated")
@@ -206,7 +220,7 @@ class RunManager:
                 model = cached.model
                 tokenizer = cached.tokenizer
             else:
-                model, tokenizer = adapter.load(record.request.model_id, device)
+                model, tokenizer = adapter.load(resolved_model, device)
                 self.model_cache.set(
                     cache_key,
                     CachedModel(
@@ -216,6 +230,7 @@ class RunManager:
                         model_id=record.request.model_id,
                     ),
                 )
+            model.zero_grad(set_to_none=True)
             progress(20, "model_loaded")
 
             image_preview = None
@@ -236,10 +251,16 @@ class RunManager:
                 "hidden_states": record.request.options.capture.hidden_states,
                 "attentions": record.request.options.capture.attentions,
             }
-            layers = adapter.select_layers(model, record.request.options.capture.layers.model_dump())
+            layers = adapter.select_layers(
+                model, record.request.options.capture.layers.model_dump()
+            )
+            if len(layers) > self.settings.limits.max_layers:
+                raise ValueError("Selected layers exceed the configured capture limit")
             capture_store = CaptureStore()
-            hook_manager = None
-            if record.request.options.capture.activations or record.request.options.capture.gradients:
+            if (
+                record.request.options.capture.activations
+                or record.request.options.capture.gradients
+            ):
                 hook_manager = HookManager(model, layers, record.request.options.capture.gradients)
                 capture_store = hook_manager.attach()
 
@@ -262,12 +283,14 @@ class RunManager:
             output_summary = adapter.postprocess(outputs, tokenizer, record.request.options.top_k)
 
             if record.request.task_type == "text_lm" and tokenizer is not None:
-                try:
-                    max_new = max(1, int(record.request.options.max_tokens))
-                    gen_ids = model.generate(**inputs, max_new_tokens=max_new)
-                    output_summary["generated_text"] = tokenizer.decode(gen_ids[0])
-                except Exception:
-                    pass
+                with torch.no_grad():
+                    gen_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=record.request.options.max_tokens,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                output_summary["generated_text"] = tokenizer.decode(gen_ids[0])
 
             log("Running analyzers")
             summaries: dict[str, Any] = {}
@@ -299,6 +322,11 @@ class RunManager:
                         "counterfactual_search",
                     ]
 
+            supported = {
+                item.id for item in self._analyzers if item.supports(record.request.task_type)
+            }
+            if set(analyzer_ids) - supported:
+                raise ValueError("Unknown or unsupported analyzer requested")
             check_cancel()
             for analyzer in self._analyzers:
                 if analyzer.id in analyzer_ids and analyzer.supports(record.request.task_type):
@@ -306,18 +334,26 @@ class RunManager:
                     output = analyzer.run(context)
                     summaries[analyzer.id] = output.summary
                     if output.arrays:
-                        path = self.artifact_store.save_arrays(artifacts, analyzer.id, output.arrays)
+                        path = self.artifact_store.save_arrays(
+                            artifacts, analyzer.id, output.arrays
+                        )
                         arrays_saved.append(path.name)
             progress(75, "analyzers_done")
 
             log("Saving artifacts")
-            if record.request.options.capture.logits and outputs.hidden_states and hasattr(model, "lm_head"):
+            if (
+                record.request.options.capture.logits
+                and outputs.hidden_states
+                and hasattr(model, "lm_head")
+            ):
                 values_list = []
                 indices_list = []
-                for hidden in outputs.hidden_states:
-                    logits = model.lm_head(hidden)
-                    last_logits = logits[:, -1, :]
-                    vals, idxs = torch.topk(last_logits, k=record.request.options.top_k, dim=-1)
+                for last_logits in project_gpt2_states(model, outputs.hidden_states):
+                    vals, idxs = torch.topk(
+                        last_logits,
+                        k=min(record.request.options.top_k, last_logits.shape[-1]),
+                        dim=-1,
+                    )
                     values_list.append(vals.detach().cpu().numpy())
                     indices_list.append(idxs.detach().cpu().numpy())
                 arrays = {
@@ -328,7 +364,8 @@ class RunManager:
                 arrays_saved.append(path.name)
             if record.request.options.capture.hidden_states and outputs.hidden_states:
                 hs_arrays = {
-                    f"layer_{i}": h.detach().cpu().numpy() for i, h in enumerate(outputs.hidden_states)
+                    f"layer_{i}": h.detach().cpu().numpy()
+                    for i, h in enumerate(outputs.hidden_states)
                 }
                 if hs_arrays:
                     path = self.artifact_store.save_arrays(artifacts, "hidden_states", hs_arrays)
@@ -378,18 +415,31 @@ class RunManager:
                 "seed": seed,
                 "status": "completed",
                 "input_text": record.request.input_text,
+                "input_tokens": (
+                    [tokenizer.decode([token]) for token in inputs["input_ids"][0].tolist()]
+                    if tokenizer is not None
+                    else []
+                ),
+                "model_revision": getattr(getattr(model, "config", None), "_commit_hash", None),
+                "options": record.request.options.model_dump(),
                 "input_image_path": record.request.input_image_path,
                 "input_image_preview": image_preview,
             }
-            self.artifact_store.save_metadata(artifacts, metadata)
             self.artifact_store.save_outputs(artifacts, output_summary)
             self.artifact_store.save_summaries(artifacts, summaries)
+            # Publish completed metadata last, after all artifacts are readable.
+            self.artifact_store.save_metadata(artifacts, metadata)
             progress(95, "artifacts_saved")
 
             record.status = "completed"
             record.outputs = output_summary
             record.summaries = summaries
-            record.artifacts = arrays_saved + ["metadata.json", "outputs.json", "summaries.json", "logs.txt"]
+            record.artifacts = arrays_saved + [
+                "metadata.json",
+                "outputs.json",
+                "summaries.json",
+                "logs.txt",
+            ]
             record.updated_at = utc_now_iso()
 
             log("Run completed")
@@ -401,3 +451,21 @@ class RunManager:
             record.error = str(exc)
             record.updated_at = utc_now_iso()
             log(f"Run failed: {exc}")
+            self.artifact_store.save_metadata(
+                artifacts,
+                {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": record.error,
+                    "task_type": record.request.task_type,
+                    "model_id": record.request.model_id,
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                },
+            )
+            self._broadcast(run_id, {"type": "status", "status": "failed", "run_id": run_id})
+        finally:
+            if hook_manager is not None:
+                hook_manager.clear()
+            if model is not None:
+                model.zero_grad(set_to_none=True)

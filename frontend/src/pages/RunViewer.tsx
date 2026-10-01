@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { exportRun, getRun } from "../api/client";
+import { exportRun, getRun, getArtifactUrl, resourceUrl } from "../api/client";
 import RunSummary from "../components/run/RunSummary";
 import AttributionText from "../components/run/AttributionText";
 import AttributionImage from "../components/run/AttributionImage";
@@ -14,6 +14,7 @@ const RunViewer: React.FC = () => {
   const navigate = useNavigate();
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [tab, setTab] = useState("overview");
   const [reportPath, setReportPath] = useState<string | null>(null);
   const [attrMethod, setAttrMethod] = useState("integrated_gradients");
@@ -21,10 +22,14 @@ const RunViewer: React.FC = () => {
   useEffect(() => {
     if (!runId) return;
     setLoading(true);
+    setError("");
+    let active = true;
     getRun(runId).then((res) => {
-      setData(res);
-      setLoading(false);
-    });
+      if (active) setData(res);
+    }).catch((error: Error) => {
+      if (active) setError(error.message);
+    }).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [runId]);
 
   useEffect(() => {
@@ -40,7 +45,10 @@ const RunViewer: React.FC = () => {
     if (!runId) return;
     if (!data || data.status === "completed" || data.status === "failed") return;
     const id = setInterval(() => {
-      getRun(runId).then((res) => setData(res));
+      getRun(runId).then((res) => setData(res)).catch((error: Error) => {
+        setError(error.message);
+        clearInterval(id);
+      });
     }, 1500);
     return () => clearInterval(id);
   }, [runId, data]);
@@ -48,21 +56,23 @@ const RunViewer: React.FC = () => {
 
   const exportReport = async () => {
     if (!runId) return;
-    const res = await exportRun(runId);
-    setReportPath(res.report_path);
+    try {
+      const res = await exportRun(runId);
+      setReportPath(resourceUrl(res.report_url));
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Export failed");
+    }
   };
 
   const shareLink = () => {
     if (!runId) return;
     const url = `${window.location.origin}/runs/${runId}`;
-    navigator.clipboard.writeText(url);
+    navigator.clipboard.writeText(url).catch(() => setError("Clipboard unavailable; copy the address bar URL."));
   };
 
   const tokens = useMemo(() => {
-    const text = data?.metadata?.input_text as string | undefined;
-    if (!text) return [];
-    return text.split(/\s+/);
-  }, [data, attrMethod]);
+    return (data?.metadata?.input_tokens as string[] | undefined)?.slice(0, 64) || [];
+  }, [data]);
 
   const attributionScores = useMemo(() => {
     if (!data) return [];
@@ -70,7 +80,7 @@ const RunViewer: React.FC = () => {
       return data?.summaries?.attention_rollout?.rollout_preview ?? [];
     }
     return data?.summaries?.integrated_gradients?.attribution_preview ?? [];
-  }, [data]);
+  }, [data, attrMethod]);
 
   const imageHeatmap = useMemo(() => {
     if (!data) return undefined;
@@ -107,15 +117,17 @@ const RunViewer: React.FC = () => {
   }
 
   if (!data) {
-    return <div className="panel">Run not found</div>;
+    return <div className="panel" role="alert">{error || "Run not found"}</div>;
   }
 
   return (
     <div className="page">
+      {(error || data.error) && <p className="panel" role="alert">{error || data.error}</p>}
+      <p className="hint">Status: {data.status}</p>
       <div className="row space-between">
         <h2>Run Viewer</h2>
         <div className="row">
-          <button className="secondary" onClick={shareLink}>Copy Share Link</button>
+          <button className="secondary" onClick={shareLink}>Copy Local Run Link</button>
           <button className="secondary" onClick={() => navigate("/")}>New Run</button>
         </div>
       </div>
@@ -125,7 +137,7 @@ const RunViewer: React.FC = () => {
           ["overview", "Overview"],
           ["attribution", "Attribution"],
           ["layers", "Layer Timeline"],
-          ["neurons", "Neuron Explorer"],
+          ["neurons", "Layer Statistics"],
           ["counterfactual", "Counterfactual"],
           ["artifacts", "Artifacts"]
         ].map(([id, label]) => (
@@ -151,7 +163,12 @@ const RunViewer: React.FC = () => {
                   <option value="attention_rollout">Attention Rollout</option>
                 </select>
               </div>
-              <AttributionText tokens={tokens} scores={attributionScores} />
+              {attributionScores.length ?
+                <AttributionText tokens={tokens.slice(0, attributionScores.length)} scores={attributionScores} /> :
+                <p className="hint">No attribution was recorded for this method.</p>}
+              <p className="hint">{attrMethod === "integrated_gradients"
+                ? "Orange and blue show positive and negative contributions relative to the recorded baseline. Color intensity is scaled within this input."
+                : "Attention flow is descriptive, not a causal explanation of the prediction."}</p>
             </section>
           ) : (
             <section className="panel">
@@ -171,8 +188,16 @@ const RunViewer: React.FC = () => {
             </section>
           )}
           <section className="panel">
-            <h3>Analyzer Summary</h3>
-            <pre className="code-block">{JSON.stringify(data.summaries ?? {}, null, 2)}</pre>
+            <h3>Recorded Analysis</h3>
+            <p className="hint">{data.metadata?.model_id}</p>
+            <h4>Model output</h4>
+            <div className="pill">{data.outputs?.prediction ?? data.outputs?.top_k?.[0]?.token ?? "Not available"}</div>
+            <p>Seed {data.metadata?.seed ?? "not recorded"} · {tokens.length || "Image"} {tokens.length ? "model tokens" : "input"}</p>
+            <pre className="code-block">{JSON.stringify(data.summaries?.[attrMethod] ?? { message: "Not captured" },
+              (key, value) => key.endsWith("_preview") ? "Available in the saved artifact" : value, 2)}</pre>
+            <details><summary>All analyzer metadata</summary>
+              <pre className="code-block">{JSON.stringify(data.summaries ?? {}, null, 2)}</pre>
+            </details>
           </section>
         </div>
       )}
@@ -198,11 +223,11 @@ const RunViewer: React.FC = () => {
       {tab === "artifacts" && (
         <section className="panel">
           <h3>Artifacts</h3>
-          <button className="secondary" onClick={exportReport}>Export Report</button>
-          {reportPath && <p className="hint">Report: {reportPath}</p>}
+          <button className="secondary" onClick={exportReport} disabled={data.status !== "completed"}>Export Report</button>
+          {reportPath && <p><a href={reportPath} target="_blank" rel="noreferrer">Open exported report</a></p>}
           <ul className="list">
             {(data.artifacts || []).map((name: string) => (
-              <li key={name}>{name}</li>
+              <li key={name}><a href={getArtifactUrl(runId!, name)} download>{name}</a></li>
             ))}
           </ul>
         </section>

@@ -23,15 +23,21 @@ class BaseAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def prepare_inputs(self, tokenizer: Any | None, raw: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    def prepare_inputs(
+        self, tokenizer: Any | None, raw: dict[str, Any], device: torch.device
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
-    def forward(self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]) -> AdapterOutputs:
+    def forward(
+        self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]
+    ) -> AdapterOutputs:
         raise NotImplementedError
 
     @abstractmethod
-    def postprocess(self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int) -> dict[str, Any]:
+    def postprocess(
+        self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int
+    ) -> dict[str, Any]:
         raise NotImplementedError
 
     @abstractmethod
@@ -45,8 +51,12 @@ class BaseAdapter(ABC):
             return all_layers
         if mode == "every_n":
             stride = int(selection.get("stride", 1))
+            if stride < 1:
+                raise ValueError("Layer stride must be positive")
             return [layer for idx, layer in enumerate(all_layers) if idx % stride == 0]
         if mode == "custom":
             chosen = selection.get("layers", [])
+            if not chosen or set(chosen) - set(all_layers):
+                raise ValueError("Custom layers must name existing model layers")
             return [layer for layer in all_layers if layer in chosen]
-        return all_layers
+        raise ValueError("Unknown layer selection mode")

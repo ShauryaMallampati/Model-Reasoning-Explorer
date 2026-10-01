@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-import os
-from pathlib import Path
+"""Download the demo weights into the standard Hugging Face and Torch caches."""
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
-from torchvision.models import resnet18, ResNet18_Weights
-
-ROOT = Path(__file__).resolve().parents[1]
-CACHE = ROOT / "backend" / ".mre_cache"
-CACHE.mkdir(parents=True, exist_ok=True)
-
-os.environ.setdefault("HF_HOME", str(CACHE))
-
-print("Downloading text LM (tiny GPT-2)...")
-AutoTokenizer.from_pretrained("sshleifer/tiny-gpt2")
-AutoModelForCausalLM.from_pretrained("sshleifer/tiny-gpt2")
-
-print("Downloading text classifier (SST-2)...")
-AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
-AutoModelForSequenceClassification.from_pretrained(
-    "distilbert-base-uncased-finetuned-sst-2-english"
+from torchvision.models import ResNet18_Weights, resnet18
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
 )
 
-print("Downloading vision model (resnet18)...")
-resnet18(weights=ResNet18_Weights.DEFAULT)
+print("Downloading tiny GPT-2...")
+AutoTokenizer.from_pretrained("sshleifer/tiny-gpt2", trust_remote_code=False)
+AutoModelForCausalLM.from_pretrained("sshleifer/tiny-gpt2", trust_remote_code=False)
 
-print("Done. Cached to", CACHE)
+print("Downloading the SST-2 text classifier...")
+classifier = "distilbert-base-uncased-finetuned-sst-2-english"
+AutoTokenizer.from_pretrained(classifier, trust_remote_code=False)
+AutoModelForSequenceClassification.from_pretrained(classifier, trust_remote_code=False)
+
+print("Downloading ResNet-18...")
+resnet18(weights=ResNet18_Weights.DEFAULT)
+print("Models downloaded to the standard Hugging Face and Torch caches.")

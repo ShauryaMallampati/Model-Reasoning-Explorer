@@ -29,6 +29,8 @@ class CounterfactualSearchAnalyzer(BaseAnalyzer):
 
         best = None
         for idx in range(len(input_ids)):
+            if input_ids[idx] in tokenizer.all_special_ids:
+                continue
             modified = input_ids[:idx] + input_ids[idx + 1 :]
             if not modified:
                 continue
@@ -54,7 +56,6 @@ class CounterfactualSearchAnalyzer(BaseAnalyzer):
     def _vision_search(self, context: Any) -> AnalyzerOutput:
         model = context.model
         inputs = context.inputs
-        device = context.device
 
         x = inputs["pixel_values"]
         baseline = int(context.outputs.logits.argmax(dim=-1).item())

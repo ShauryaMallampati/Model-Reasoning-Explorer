@@ -3,9 +3,9 @@ from __future__ import annotations
 import typer
 import uvicorn
 
-from mre_backend.api.schemas import RunRequest, RunOptions
-from mre_backend.core.config import load_settings
+from mre_backend.api.schemas import RunOptions, RunRequest
 from mre_backend.core.artifacts import ArtifactStore
+from mre_backend.core.config import load_settings
 from mre_backend.core.run_manager import RunManager
 from mre_backend.core.ws import WsManager
 from mre_backend.export_report import export_report
@@ -14,7 +14,7 @@ app = typer.Typer(add_completion=False)
 
 
 @app.command()
-def serve(host: str = "0.0.0.0", port: int = 8000):
+def serve(host: str = "127.0.0.1", port: int = 8000):
     """Start the FastAPI server."""
     uvicorn.run("mre_backend.main:app", host=host, port=port, reload=False)
 
@@ -45,6 +45,9 @@ def demo_text(prompt: str = "The capital of France is", max_tokens: int = 12):
         options=options,
     )
     record = run_manager.run_sync(request)
+    if record.status != "completed":
+        typer.echo(f"Run failed: {record.error}", err=True)
+        raise typer.Exit(1)
     typer.echo(f"Run complete: {record.run_id}")
 
 
@@ -61,8 +64,12 @@ def demo_vision(image: str):
         task_type="image_classification",
         model_id="resnet18",
         input_image_path=image,
+        options=RunOptions(capture={"gradients": True}),
     )
     record = run_manager.run_sync(request)
+    if record.status != "completed":
+        typer.echo(f"Run failed: {record.error}", err=True)
+        raise typer.Exit(1)
     typer.echo(f"Run complete: {record.run_id}")
 
 

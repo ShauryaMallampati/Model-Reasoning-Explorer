@@ -40,6 +40,10 @@ class GradCamAnalyzer(BaseAnalyzer):
         preview = cam_np[:: max(1, cam_np.shape[0] // 16), :: max(1, cam_np.shape[1] // 16)]
 
         return AnalyzerOutput(
-            summary={"layer": name, "shape": list(cam_np.shape), "heatmap_preview": preview.tolist()},
+            summary={
+                "layer": name,
+                "shape": list(cam_np.shape),
+                "heatmap_preview": preview.tolist(),
+            },
             arrays={"heatmap": cam_np.astype(np.float32)},
         )

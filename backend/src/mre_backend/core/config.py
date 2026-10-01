@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .utils import env_bool
 
@@ -20,14 +20,14 @@ class PathConfig(BaseModel):
 
 
 class LimitsConfig(BaseModel):
-    max_upload_mb: int = 20
-    max_batch_size: int = 16
-    max_layers: int = 128
+    max_upload_mb: int = Field(default=20, ge=1, le=100)
+    max_batch_size: int = Field(default=16, ge=1, le=64)
+    max_layers: int = Field(default=128, ge=1, le=512)
 
 
 class ExecutionConfig(BaseModel):
     allow_gpu: bool = False
-    seed: int = 42
+    seed: int = Field(default=42, ge=0, le=2**32 - 1)
 
 
 class ModelsConfig(BaseModel):
@@ -56,10 +56,14 @@ def _resolve_paths(raw: dict[str, Any], root: Path) -> dict[str, Any]:
 
 
 def load_settings() -> SettingsBundle:
-    config_path = Path(os.environ.get("MRE_CONFIG", ""))
-    if not config_path:
-        # Default to backend/mre_config.toml
-        config_path = Path(__file__).resolve().parents[3] / "mre_config.toml"
+    override = os.environ.get("MRE_CONFIG")
+    config_path = (
+        Path(override).expanduser()
+        if override
+        else Path(__file__).resolve().parents[3] / "mre_config.toml"
+    )
+    if not config_path.is_file():
+        raise ValueError("Configuration file not found; set MRE_CONFIG to mre_config.toml")
 
     config_data: dict[str, Any] = {}
     if config_path.exists():
@@ -75,7 +79,8 @@ def load_settings() -> SettingsBundle:
         base_dir = (config_path.parent / base_dir_path).resolve()
 
     paths = _resolve_paths(
-        config_data.get("paths",
+        config_data.get(
+            "paths",
             {
                 "base_dir": str(base_dir),
                 "runs_dir": "backend/runs",

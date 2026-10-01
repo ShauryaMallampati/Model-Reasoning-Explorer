@@ -17,7 +17,6 @@ class OcclusionAnalyzer(BaseAnalyzer):
     def run(self, context: Any) -> AnalyzerOutput:
         inputs = context.inputs
         model = context.model
-        device = context.device
 
         x = inputs["pixel_values"]
         target = int(context.outputs.logits.argmax(dim=-1).item())

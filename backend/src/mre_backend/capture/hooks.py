@@ -25,28 +25,27 @@ class HookManager:
         for name, module in self.model.named_modules():
             if name in self.layers:
                 self._handles.append(module.register_forward_hook(self._make_forward_hook(name)))
-                if self.capture_gradients:
-                    self._handles.append(module.register_full_backward_hook(self._make_backward_hook(name)))
         return self.store
 
     def clear(self) -> None:
         for handle in self._handles:
-            try:
-                handle.remove()
-            except Exception:
-                pass
+            handle.remove()
         self._handles.clear()
 
     def _make_forward_hook(self, name: str):
         def hook(_module: nn.Module, _inputs: tuple[Any, ...], output: Any) -> None:
-            if isinstance(output, torch.Tensor):
-                self.store.activations[name] = output.detach().cpu()
+            # Transformer blocks often return (hidden_states, cache, ...).
+            tensor = output[0] if isinstance(output, (tuple, list)) and output else output
+            if not isinstance(tensor, torch.Tensor):
+                return
+            # Clone so later in-place activations cannot change recorded values.
+            self.store.activations[name] = tensor.detach().cpu().clone()
+            if self.capture_gradients and tensor.requires_grad:
+                # Tensor hooks avoid full-backward-hook views, which conflict
+                # with the in-place ReLUs used by torchvision ResNet.
+                def capture_gradient(gradient: torch.Tensor) -> None:
+                    self.store.gradients[name] = gradient.detach().cpu().clone()
 
-        return hook
-
-    def _make_backward_hook(self, name: str):
-        def hook(_module: nn.Module, _grad_input: tuple[Any, ...], grad_output: tuple[Any, ...]) -> None:
-            if grad_output and isinstance(grad_output[0], torch.Tensor):
-                self.store.gradients[name] = grad_output[0].detach().cpu()
+                self._handles.append(tensor.register_hook(capture_gradient))
 
         return hook

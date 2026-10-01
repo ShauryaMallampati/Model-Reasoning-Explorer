@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,8 +16,15 @@ from mre_backend.adapters.text_transformer import TextTransformerAdapter
 from mre_backend.adapters.vision_resnet import VisionResNetAdapter
 from mre_backend.api.schemas import DatasetRunRequest
 from mre_backend.core.artifacts import ArtifactStore
-from mre_backend.core.model_cache import CachedModel, ModelCache
-from mre_backend.core.utils import require_safe_path, safe_run_id, set_seed, utc_now_iso
+from mre_backend.core.model_cache import INFERENCE_LOCK, CachedModel, ModelCache
+from mre_backend.core.utils import (
+    atomic_json,
+    require_safe_path,
+    resolve_model_id,
+    safe_run_id,
+    set_seed,
+    utc_now_iso,
+)
 
 
 @dataclass
@@ -41,6 +49,10 @@ class DatasetManager:
         self._lock = threading.Lock()
 
     def start(self, request: DatasetRunRequest, model_id: str, task_type: str) -> str:
+        resolve_model_id(model_id, self.settings)
+        expected = "text_classification" if request.kind == "text" else "image_classification"
+        if task_type != expected:
+            raise ValueError("Dataset kind and task type must agree")
         dataset_run_id = safe_run_id(prefix="dataset")
         now = utc_now_iso()
         record = DatasetRunRecord(
@@ -56,9 +68,21 @@ class DatasetManager:
         return dataset_run_id
 
     def get(self, dataset_run_id: str) -> DatasetRunRecord | None:
-        return self._runs.get(dataset_run_id)
+        record = self._runs.get(dataset_run_id)
+        if record is not None:
+            return record
+        path = self.artifact_store.get_artifact_path(dataset_run_id, "dataset.json")
+        if not path.is_file():
+            return None
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        saved["request"] = DatasetRunRequest(**saved["request"])
+        return DatasetRunRecord(**saved)
 
     def _run_task(self, record: DatasetRunRecord, model_id: str, task_type: str) -> None:
+        with INFERENCE_LOCK:
+            self._run_task_serial(record, model_id, task_type)
+
+    def _run_task_serial(self, record: DatasetRunRecord, model_id: str, task_type: str) -> None:
         try:
             record.status = "running"
             record.updated_at = utc_now_iso()
@@ -80,14 +104,18 @@ class DatasetManager:
                 model = cached.model
                 tokenizer = cached.tokenizer
             else:
-                model, tokenizer = adapter.load(model_id, device)
+                model, tokenizer = adapter.load(resolve_model_id(model_id, self.settings), device)
                 self.model_cache.set(
                     cache_key,
-                    CachedModel(model=model, tokenizer=tokenizer, task_type=task_type, model_id=model_id),
+                    CachedModel(
+                        model=model, tokenizer=tokenizer, task_type=task_type, model_id=model_id
+                    ),
                 )
 
             if record.request.kind == "text":
-                summary, examples = self._run_text(record, adapter, model, tokenizer, device, model_id)
+                summary, examples = self._run_text(
+                    record, adapter, model, tokenizer, device, model_id
+                )
             else:
                 summary, examples = self._run_images(record, adapter, model, device, model_id)
 
@@ -99,6 +127,21 @@ class DatasetManager:
             record.status = "failed"
             record.error = str(exc)
             record.updated_at = utc_now_iso()
+        finally:
+            artifacts = self.artifact_store.create(record.dataset_run_id)
+            atomic_json(
+                artifacts.run_dir / "dataset.json",
+                {
+                    "dataset_run_id": record.dataset_run_id,
+                    "status": record.status,
+                    "request": record.request.model_dump(),
+                    "created_at": record.created_at,
+                    "updated_at": record.updated_at,
+                    "summary": record.summary,
+                    "examples": record.examples,
+                    "error": record.error,
+                },
+            )
 
     def _run_text(
         self,
@@ -114,13 +157,35 @@ class DatasetManager:
             path = self.settings.paths.safe_data_dir / path
         require_safe_path(path, self.settings.paths.safe_data_dir)
 
+        if not path.is_file() or path.stat().st_size > self.settings.limits.max_upload_mb * 1024**2:
+            raise ValueError("Dataset file missing or exceeds the upload limit")
         rows = []
-        with path.open() as f:
+        with path.open(encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
+            required = {record.request.text_column, record.request.label_column}
+            if not required.issubset(reader.fieldnames or []):
+                raise ValueError("CSV must contain the configured text and label columns")
             for row in reader:
+                if (
+                    not row.get(record.request.text_column, "").strip()
+                    or not row.get(record.request.label_column, "").strip()
+                ):
+                    raise ValueError("Text and label values cannot be blank")
                 rows.append(row)
                 if len(rows) >= record.request.max_samples:
                     break
+
+        if not rows:
+            raise ValueError("Dataset contains no examples")
+        labels = list(getattr(model.config, "id2label", {}).values())
+        canonical = {str(label).casefold(): str(label) for label in labels}
+        if len(canonical) != len(labels):
+            raise ValueError("Model labels are ambiguous under case-insensitive matching")
+        for row in rows:
+            key = row[record.request.label_column].strip().casefold()
+            if key not in canonical:
+                raise ValueError("CSV labels must match this model's label names")
+            row[record.request.label_column] = canonical[key]
 
         examples = []
         y_true = []
@@ -152,9 +217,9 @@ class DatasetManager:
                 "created_at": utc_now_iso(),
             }
             outputs_summary = adapter.postprocess(outputs, tokenizer, top_k=3)
-            self.artifact_store.save_metadata(artifacts, metadata)
             self.artifact_store.save_outputs(artifacts, outputs_summary)
             self.artifact_store.save_summaries(artifacts, {})
+            self.artifact_store.save_metadata(artifacts, metadata)
 
             pred_label = outputs_summary.get("prediction", str(pred))
             y_pred.append(pred_label)
@@ -213,7 +278,9 @@ class DatasetManager:
             )
 
         high_conf_errors = [
-            ex for ex in examples if ex.get("label") != ex.get("prediction") and ex.get("confidence", 0) > 0.8
+            ex
+            for ex in examples
+            if ex.get("label") != ex.get("prediction") and ex.get("confidence", 0) > 0.8
         ][:10]
 
         summary = {
@@ -234,7 +301,9 @@ class DatasetManager:
         }
         if embeddings:
             X = np.stack(embeddings)
-            k = min(4, len(X))
+            if not np.isfinite(X).all():
+                raise ValueError("Model returned non-finite dataset embeddings")
+            k = min(4, len(np.unique(X, axis=0)))
             if k >= 2:
                 km = KMeans(n_clusters=k, n_init=5, random_state=self.settings.execution.seed)
                 clusters = km.fit_predict(X)
@@ -245,7 +314,11 @@ class DatasetManager:
                 for cid in range(k):
                     cluster_examples = [ex for ex in examples if ex.get("cluster") == cid][:3]
                     cluster_summary.append(
-                        {"cluster": cid, "count": sum(1 for ex in examples if ex.get("cluster") == cid), "examples": cluster_examples}
+                        {
+                            "cluster": cid,
+                            "count": sum(1 for ex in examples if ex.get("cluster") == cid),
+                            "examples": cluster_examples,
+                        }
                     )
                 summary["cluster_summary"] = cluster_summary
 
@@ -264,11 +337,22 @@ class DatasetManager:
             path = self.settings.paths.safe_data_dir / path
         require_safe_path(path, self.settings.paths.safe_data_dir)
 
-        images = list(path.glob("**/*.ppm")) + list(path.glob("**/*.png"))
+        if not path.is_dir():
+            raise ValueError("Image dataset path must be a directory")
+        images = sorted(
+            file
+            for file in path.rglob("*")
+            if file.suffix.lower() in {".ppm", ".png", ".jpg", ".jpeg"}
+        )
         images = images[: record.request.max_samples]
+        if not images:
+            raise ValueError("Image dataset contains no supported images")
 
         examples = []
         for img in images:
+            require_safe_path(img, self.settings.paths.safe_data_dir)
+            if img.stat().st_size > self.settings.limits.max_upload_mb * 1024**2:
+                raise ValueError("Image file exceeds the upload limit")
             inputs = adapter.prepare_inputs(None, {"image_path": img}, device)
             outputs = adapter.forward(model, inputs, {})
             probs = torch.softmax(outputs.logits, dim=-1)[0]
@@ -286,9 +370,9 @@ class DatasetManager:
                 "created_at": utc_now_iso(),
             }
             outputs_summary = adapter.postprocess(outputs, None, top_k=3)
-            self.artifact_store.save_metadata(artifacts, metadata)
             self.artifact_store.save_outputs(artifacts, outputs_summary)
             self.artifact_store.save_summaries(artifacts, {})
+            self.artifact_store.save_metadata(artifacts, metadata)
 
             examples.append(
                 {

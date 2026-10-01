@@ -14,8 +14,10 @@ class VisionResNetAdapter(BaseAdapter):
     task_type = "image_classification"
 
     def __init__(self) -> None:
-        self._preprocess = None
-        self._labels = None
+        # These are needed even when the model is reused from the cache.
+        weights = ResNet18_Weights.DEFAULT
+        self._preprocess = weights.transforms()
+        self._labels = weights.meta.get("categories", [])
 
     def load(self, model_id: str, device: torch.device) -> tuple[Any, Any | None]:
         if model_id != "resnet18":
@@ -28,7 +30,9 @@ class VisionResNetAdapter(BaseAdapter):
         self._labels = weights.meta.get("categories", [])
         return model, None
 
-    def prepare_inputs(self, tokenizer: Any | None, raw: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    def prepare_inputs(
+        self, tokenizer: Any | None, raw: dict[str, Any], device: torch.device
+    ) -> dict[str, Any]:
         path = raw.get("image_path")
         image = raw.get("image")
         if image is None:
@@ -42,12 +46,16 @@ class VisionResNetAdapter(BaseAdapter):
         tensor = self._preprocess(image).unsqueeze(0).to(device)
         return {"pixel_values": tensor}
 
-    def forward(self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]) -> AdapterOutputs:
+    def forward(
+        self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]
+    ) -> AdapterOutputs:
         with torch.set_grad_enabled(bool(capture.get("gradients"))):
             outputs = model(inputs["pixel_values"])
         return AdapterOutputs(logits=outputs)
 
-    def postprocess(self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int) -> dict[str, Any]:
+    def postprocess(
+        self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int
+    ) -> dict[str, Any]:
         probs = torch.softmax(outputs.logits, dim=-1)
         values, indices = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
         top = []

@@ -14,13 +14,17 @@ class TextTransformerAdapter(BaseAdapter):
         self._id2label: dict[int, str] = {}
 
     def load(self, model_id: str, device: torch.device) -> tuple[Any, Any]:
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=False)
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
         if self.task_type == "text_lm":
-            model = AutoModelForCausalLM.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id, attn_implementation="eager", trust_remote_code=False
+            )
         else:
-            model = AutoModelForSequenceClassification.from_pretrained(model_id)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_id, attn_implementation="eager", trust_remote_code=False
+            )
             self._id2label = getattr(model.config, "id2label", {}) or {}
         model.to(device)
         model.eval()
@@ -35,9 +39,15 @@ class TextTransformerAdapter(BaseAdapter):
         if not text:
             raise ValueError("Input text is required")
         inputs = tokenizer(text, return_tensors="pt")
+        if inputs["input_ids"].shape[1] > min(256, tokenizer.model_max_length):
+            raise ValueError("Inspection inputs are limited to 256 model tokens")
         return {k: v.to(device) for k, v in inputs.items()}
 
-    def forward(self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]) -> AdapterOutputs:
+    def forward(
+        self, model: Any, inputs: dict[str, Any], capture: dict[str, Any]
+    ) -> AdapterOutputs:
+        # Each run creates an adapter, but the model may come from the cache.
+        self._id2label = getattr(model.config, "id2label", {}) or {}
         with torch.set_grad_enabled(bool(capture.get("gradients"))):
             outputs = model(
                 **inputs,
@@ -49,17 +59,22 @@ class TextTransformerAdapter(BaseAdapter):
         logits = outputs.logits
         return AdapterOutputs(logits=logits, hidden_states=hidden_states, attentions=attentions)
 
-    def postprocess(self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int) -> dict[str, Any]:
+    def postprocess(
+        self, outputs: AdapterOutputs, tokenizer: Any | None, top_k: int
+    ) -> dict[str, Any]:
         if tokenizer is None:
             return {}
         if self.task_type == "text_lm":
             last_logits = outputs.logits[:, -1, :]
             probs = torch.softmax(last_logits, dim=-1)
-            values, indices = torch.topk(probs, k=top_k, dim=-1)
+            values, indices = torch.topk(probs, k=min(top_k, probs.size(-1)), dim=-1)
             tokens = [tokenizer.decode([idx]) for idx in indices[0].tolist()]
             return {
                 "prediction": tokens[0],
-                "top_k": [{"token": t, "prob": float(p)} for t, p in zip(tokens, values[0])],
+                "top_k": [
+                    {"token": t, "prob": float(p)}
+                    for t, p in zip(tokens, values[0].detach().tolist())
+                ],
             }
 
         probs = torch.softmax(outputs.logits, dim=-1)
@@ -76,6 +91,11 @@ class TextTransformerAdapter(BaseAdapter):
             return [f"transformer.h.{i}" for i in range(len(model.transformer.h))]
         if hasattr(model, "transformer") and hasattr(model.transformer, "layer"):
             return [f"transformer.layer.{i}" for i in range(len(model.transformer.layer))]
+        if hasattr(model, "distilbert"):
+            return [
+                f"distilbert.transformer.layer.{i}"
+                for i in range(len(model.distilbert.transformer.layer))
+            ]
         if hasattr(model, "encoder") and hasattr(model.encoder, "layer"):
             return [f"encoder.layer.{i}" for i in range(len(model.encoder.layer))]
         return [name for name, _ in model.named_modules() if name]

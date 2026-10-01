@@ -1,4 +1,5 @@
 import torch
+
 from mre_backend.adapters.text_transformer import TextTransformerAdapter
 
 

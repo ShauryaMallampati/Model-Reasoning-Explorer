@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+
 import torch
 
 from .base import AnalyzerOutput, BaseAnalyzer
@@ -13,60 +14,66 @@ class ActivationPatchingAnalyzer(BaseAnalyzer):
         return task_type == "text_lm"
 
     def run(self, context: Any) -> AnalyzerOutput:
-        counterfactual = context.request.options.counterfactual_text
-        if not counterfactual:
+        text = context.request.options.counterfactual_text
+        if not text:
             return AnalyzerOutput(summary={"message": "No counterfactual_text provided"})
-
         model = context.model
-        tokenizer = context.tokenizer
-        device = context.device
+        if getattr(model.config, "model_type", None) != "gpt2":
+            return AnalyzerOutput(summary={"message": "Patching is verified only for GPT-2 blocks"})
+        inputs = context.tokenizer(text, return_tensors="pt")
+        inputs = {key: value.to(context.device) for key, value in inputs.items()}
+        if inputs["input_ids"].shape != context.inputs["input_ids"].shape:
+            raise ValueError(
+                "Patching requires equal token counts and explicit positional alignment"
+            )
+        blocks = list(model.transformer.h)
+        selected = context.request.options.patch_layers
+        if selected is None:
+            selected = list(range(max(0, len(blocks) - 4), len(blocks)))
+        if not selected or any(index < 0 or index >= len(blocks) for index in selected):
+            raise ValueError("Patch layer is outside the model")
+        selected = list(dict.fromkeys(selected))
+        captured = {}
+        handles = []
 
-        if not hasattr(model, "transformer") or not hasattr(model.transformer, "h"):
-            return AnalyzerOutput(summary={"message": "Model does not support patching"})
+        def capture(index):
+            def hook(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                captured[index] = hidden.detach().clone()
 
-        # Run counterfactual to collect hidden states
-        cf_inputs = tokenizer(counterfactual, return_tensors="pt")
-        cf_inputs = {k: v.to(device) for k, v in cf_inputs.items()}
-        with torch.no_grad():
-            cf_outputs = model(**cf_inputs, output_hidden_states=True)
-        cf_hidden = cf_outputs.hidden_states
+            return hook
 
-        if cf_hidden is None:
-            return AnalyzerOutput(summary={"message": "No hidden states for counterfactual"})
+        try:
+            for index in selected:
+                handles.append(blocks[index].register_forward_hook(capture(index)))
+            with torch.no_grad():
+                model(**inputs)
+        finally:
+            for handle in handles:
+                handle.remove()
 
         baseline_logits = context.outputs.logits[:, -1, :]
-        baseline_token = int(baseline_logits.argmax(dim=-1).item())
-
-        layer_modules = list(model.transformer.h)
-        total_layers = len(layer_modules)
-        selection = context.request.options.patch_layers
-        if not selection:
-            selection = list(range(max(0, total_layers - 4), total_layers))
-
+        token = int(baseline_logits.argmax(dim=-1).item())
+        baseline_probability = torch.softmax(baseline_logits, dim=-1)[0, token].item()
         results = []
-        for layer_idx in selection:
-            if layer_idx + 1 >= len(cf_hidden):
-                continue
+        for index in selected:
 
-            def hook(_module, _inputs, output):
-                hidden = cf_hidden[layer_idx + 1]
-                if isinstance(output, tuple):
-                    return (hidden,) + output[1:]
-                return hidden
+            def replace(_module, _inputs, output):
+                hidden = captured[index]
+                return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
 
-            handle = layer_modules[layer_idx].register_forward_hook(hook)
-            with torch.no_grad():
-                patched = model(**context.inputs)
-            handle.remove()
-
-            patched_logits = patched.logits[:, -1, :]
-            patched_prob = torch.softmax(patched_logits, dim=-1)[0, baseline_token].item()
-            base_prob = torch.softmax(baseline_logits, dim=-1)[0, baseline_token].item()
-            results.append(
-                {
-                    "layer": layer_idx,
-                    "delta_prob": float(patched_prob - base_prob),
-                }
-            )
-
-        return AnalyzerOutput(summary={"baseline_token": baseline_token, "results": results})
+            handle = blocks[index].register_forward_hook(replace)
+            try:
+                with torch.no_grad():
+                    logits = model(**context.inputs).logits[:, -1, :]
+            finally:
+                handle.remove()
+            probability = torch.softmax(logits, dim=-1)[0, token].item()
+            results.append({"layer": index, "delta_prob": probability - baseline_probability})
+        return AnalyzerOutput(
+            summary={
+                "baseline_token": token,
+                "results": results,
+                "alignment": "same token count, position by position; not semantic alignment",
+            }
+        )

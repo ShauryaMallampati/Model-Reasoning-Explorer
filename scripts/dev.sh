@@ -18,10 +18,10 @@ if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
 fi
 
 set +e
-uvicorn mre_backend.main:app --reload --host 0.0.0.0 --port 8000 &
+uvicorn mre_backend.main:app --reload --host 127.0.0.1 --port 8000 &
 BACKEND_PID=$!
 
-cd "$FRONTEND_DIR" && npm run dev -- --host 0.0.0.0 --port 5173 &
+(cd "$FRONTEND_DIR" && npm run dev -- --host 127.0.0.1 --port 5173 --strictPort) &
 FRONTEND_PID=$!
 
 cleanup() {

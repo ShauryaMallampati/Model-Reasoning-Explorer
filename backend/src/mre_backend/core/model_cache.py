@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
+
+# Cached hooks and PyTorch's random generators are shared process state.
+# Keep this local inspection tool deterministic by serializing model execution.
+INFERENCE_LOCK = RLock()
 
 
 @dataclass

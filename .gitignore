@@ -21,6 +21,11 @@ dist/
 Thumbs.db
 
 # Artifacts
+output/
+.playwright-cli/
+backend/build/
+models/*
+!models/.gitkeep
 backend/runs/
 !backend/runs/.gitkeep
 backend/reports/

@@ -1,99 +1,45 @@
 import React from "react";
+import type { ComparisonSummary } from "../../api/client";
 import Chart from "../common/Chart";
 import AttributionText from "../run/AttributionText";
 
-type DiffPanelsProps = {
-  summary?: Record<string, unknown>;
-};
-
-const DiffPanels: React.FC<DiffPanelsProps> = ({ summary }) => {
-  const deltas = (summary?.logit_lens_delta?.deltas as number[]) || [];
-  const layerSimilarity = (summary?.layer_similarity?.values as number[]) || [];
-  const attentionDelta = (summary?.attention_delta?.values as number[]) || [];
-  const attributionDiff = summary?.attribution_diff;
-  const tokensA = (summary?.generated_a || "").split(/\s+/).filter(Boolean);
-  const tokensB = (summary?.generated_b || "").split(/\s+/).filter(Boolean);
-  const maxLen = Math.max(tokensA.length, tokensB.length);
-  const diffRows = Array.from({ length: maxLen }).map((_, idx) => ({
-    a: tokensA[idx] || "",
-    b: tokensB[idx] || "",
-    same: tokensA[idx] === tokensB[idx]
-  }));
-
-  const deltaOption = {
-    xAxis: { type: "category", data: deltas.map((_, i) => i) },
-    yAxis: { type: "value" },
-    series: [{ data: deltas, type: "bar" }]
-  };
-
-  const simOption = {
-    xAxis: { type: "category", data: layerSimilarity.map((_, i) => i) },
-    yAxis: { type: "value" },
-    series: [{ data: layerSimilarity, type: "line", smooth: true }]
-  };
-
-  const attOption = {
-    xAxis: { type: "category", data: attentionDelta.map((_, i) => i) },
-    yAxis: { type: "value" },
-    series: [{ data: attentionDelta, type: "bar" }]
-  };
-
+const DiffPanels: React.FC<{ summary?: ComparisonSummary }> = ({ summary }) => {
+  if (!summary) return <p className="hint">Choose two completed runs to compare.</p>;
+  const similarity = summary.layer_similarity;
+  const attention = summary.attention_delta;
+  const attribution = summary.attribution_diff;
   return (
     <div className="grid two">
       <section className="panel">
-        <h3>Prediction Diff</h3>
+        <h3>Output Comparison</h3>
         <div className="grid two">
-          <div>
-            <h4>Run A</h4>
-            <div className="pill">{summary?.prediction_a ?? "-"}</div>
-            <p className="hint">{summary?.generated_a}</p>
-          </div>
-          <div>
-            <h4>Run B</h4>
-            <div className="pill">{summary?.prediction_b ?? "-"}</div>
-            <p className="hint">{summary?.generated_b}</p>
-          </div>
-        </div>
-        {summary?.logit_lens_delta?.pinpoint_layer !== undefined && (
-          <p className="hint">Pinpoint layer: {summary.logit_lens_delta.pinpoint_layer}</p>
-        )}
-      </section>
-      <section className="panel">
-        <h3>Layerwise Similarity</h3>
-        <Chart option={simOption} />
-      </section>
-      <section className="panel">
-        <h3>Logit Lens Delta</h3>
-        <Chart option={deltaOption} />
-      </section>
-      <section className="panel">
-        <h3>Attention Delta</h3>
-        <Chart option={attOption} />
-      </section>
-      <section className="panel">
-        <h3>Attribution Diff</h3>
-        {attributionDiff?.type === "text" ? (
-          <AttributionText
-            tokens={(summary?.generated_a || "").split(/\s+/).slice(0, (attributionDiff.preview || []).length)}
-            scores={attributionDiff.preview || []}
-          />
-        ) : (
-          <pre className="code-block">{JSON.stringify(attributionDiff ?? {}, null, 2)}</pre>
-        )}
-      </section>
-      <section className="panel">
-        <h3>Diff View</h3>
-        <div className="diff-view">
-          {diffRows.map((row, idx) => (
-            <div key={idx} className={row.same ? "diff-row" : "diff-row diff-row-changed"}>
-              <span className="diff-cell">{row.a}</span>
-              <span className="diff-cell">{row.b}</span>
+          {(["a", "b"] as const).map((side) => (
+            <div key={side}>
+              <h4>Run {side.toUpperCase()}</h4>
+              <div className="pill">{summary[`prediction_${side}`] ?? "Next-token model"}</div>
+              <p>{summary[`generated_${side}`] || "No generated text"}</p>
             </div>
           ))}
         </div>
+        {summary.notes?.map((note) => <p className="hint" key={note}>{note}</p>)}
       </section>
+      {similarity && <section className="panel">
+        <h3>Mean Hidden-State Cosine Similarity</h3>
+        <Chart option={{ xAxis: { type: "category", data: similarity.layers },
+          yAxis: { type: "value" }, series: [{ data: similarity.values, type: "line" }] }} />
+      </section>}
+      {attention && <section className="panel">
+        <h3>Mean Absolute Attention Difference</h3>
+        <Chart option={{ xAxis: { type: "category", data: attention.layers },
+          yAxis: { type: "value" }, series: [{ data: attention.values, type: "bar" }] }} />
+      </section>}
+      {attribution && <section className="panel">
+        <h3>Attribution Difference</h3>
+        {attribution.type === "text" ?
+          <AttributionText tokens={attribution.tokens || []} scores={attribution.preview} /> :
+          <pre className="code-block">{JSON.stringify(attribution.preview, null, 2)}</pre>}
+      </section>}
     </div>
   );
 };
-
 export default DiffPanels;

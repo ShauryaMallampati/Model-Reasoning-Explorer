@@ -3,13 +3,15 @@ import Editor from "react-simple-code-editor";
 import Prism from "prismjs";
 import "prismjs/components/prism-markdown";
 import { cancelRun, listModels, startRun } from "../api/client";
+import type { ModelOption, TaskType } from "../api/client";
 import LogsPanel from "../components/run/LogsPanel";
 import Spinner from "../components/common/Spinner";
 import { useRunStore } from "../state/store";
 
 const Home: React.FC = () => {
-  const [models, setModels] = useState<any[]>([]);
-  const [taskType, setTaskType] = useState("text_lm");
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [taskType, setTaskType] = useState<TaskType>("text_lm");
+  const [error, setError] = useState("");
   const [modelId, setModelId] = useState("");
   const [prompt, setPrompt] = useState("The capital of France is");
   const [imageBase64, setImageBase64] = useState<string | undefined>();
@@ -34,7 +36,7 @@ const Home: React.FC = () => {
         setModelId(data.models[0].id);
         setTaskType(data.models[0].task_type);
       }
-    });
+    }).catch((error: Error) => setError(error.message));
   }, []);
 
   useEffect(() => {
@@ -60,6 +62,7 @@ const Home: React.FC = () => {
 
   const run = async () => {
     clear();
+    setError("");
     setLoading(true);
     const payload: any = {
       task_type: taskType,
@@ -83,24 +86,30 @@ const Home: React.FC = () => {
     } else {
       payload.input_image_base64 = imageBase64;
     }
-    const res = await startRun(payload);
-    setRunId(res.run_id);
-    setLoading(false);
+    try {
+      const res = await startRun(payload);
+      setRunId(res.run_id);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Run failed");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const cancel = async () => {
     if (!runId) return;
-    await cancelRun(runId);
+    await cancelRun(runId).catch((error: Error) => setError(error.message));
   };
 
   return (
     <div className="page">
       <section className="panel">
         <h2>Run Launcher</h2>
+        {error && <p role="alert">{error}</p>}
         <div className="grid two">
           <div>
             <label>Task Type</label>
-            <select value={taskType} onChange={(e) => setTaskType(e.target.value)}>
+            <select value={taskType} onChange={(e) => setTaskType(e.target.value as TaskType)}>
               <option value="text_lm">Text LM (Next Token)</option>
               <option value="text_classification">Text Classification</option>
               <option value="image_classification">Image Classification</option>
@@ -126,6 +135,8 @@ const Home: React.FC = () => {
             <Editor
               value={prompt}
               onValueChange={setPrompt}
+              textareaId="inspection-prompt"
+              aria-label="Prompt"
               highlight={(code) => Prism.highlight(code, Prism.languages.markdown, "markdown")}
               padding={12}
               className="code-editor"
@@ -175,7 +186,7 @@ const Home: React.FC = () => {
               checked={captureLogits}
               onChange={(e) => setCaptureLogits(e.target.checked)}
             />
-            Capture logits per layer
+            Capture layer output-head projections
           </label>
         </div>
         {taskType === "image_classification" && !captureGradients && (
@@ -198,6 +209,8 @@ const Home: React.FC = () => {
               <label>Stride</label>
               <input
                 type="number"
+                min={1}
+                max={128}
                 value={layerStride}
                 onChange={(e) => setLayerStride(Number(e.target.value))}
                 disabled={layerMode !== "every_n"}
@@ -215,7 +228,7 @@ const Home: React.FC = () => {
           </div>
         </div>
         <div className="row">
-          <button className="primary" onClick={run} disabled={loading}>
+          <button className="primary" onClick={run} disabled={loading || !modelId}>
             {loading ? "Running..." : "Run"}
           </button>
           {runId && status === "running" && (

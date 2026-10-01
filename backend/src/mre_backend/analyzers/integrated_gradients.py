@@ -3,15 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import torch
+from captum.attr import IntegratedGradients, LayerIntegratedGradients
 
 from .base import AnalyzerOutput, BaseAnalyzer
-
-try:
-    from captum.attr import IntegratedGradients, LayerIntegratedGradients
-except Exception:  # pragma: no cover - optional
-    IntegratedGradients = None
-    LayerIntegratedGradients = None
 
 
 class IntegratedGradientsAnalyzer(BaseAnalyzer):
@@ -21,71 +15,58 @@ class IntegratedGradientsAnalyzer(BaseAnalyzer):
         return task_type in {"text_lm", "text_classification", "image_classification"}
 
     def run(self, context: Any) -> AnalyzerOutput:
-        if IntegratedGradients is None:
-            return AnalyzerOutput(summary={"message": "captum not installed"})
-
-        model = context.model
-        outputs = context.outputs
-        inputs = context.inputs
+        model, inputs = context.model, context.inputs
         if context.task_type == "image_classification":
-            target = int(outputs.logits.argmax(dim=-1).item())
-
-            def forward_fn(x):
-                return model(x)
-
-            ig = IntegratedGradients(forward_fn)
-            attributions = ig.attribute(inputs["pixel_values"], target=target)
-            attr = attributions[0].detach().cpu().numpy()
-            attr = attr.mean(axis=0)
-            attr = attr - attr.min()
-            if attr.max() > 0:
-                attr = attr / attr.max()
-            preview = attr[:: max(1, attr.shape[0] // 16), :: max(1, attr.shape[1] // 16)]
-            return AnalyzerOutput(
-                summary={"target": target, "shape": list(attr.shape), "heatmap_preview": preview.tolist()},
-                arrays={"attribution": attr.astype(np.float32)},
-            )
-
-        if context.task_type == "text_classification":
-            target = int(outputs.logits.argmax(dim=-1).item())
-            embed = model.get_input_embeddings()
-
-            def forward_fn(input_ids, attention_mask):
-                out = model(input_ids=input_ids, attention_mask=attention_mask)
-                return out.logits
-
-            lig = LayerIntegratedGradients(forward_fn, embed)
-            attributions, _ = lig.attribute(
-                inputs["input_ids"],
-                additional_forward_args=(inputs.get("attention_mask"),),
+            target = int(context.outputs.logits.argmax(dim=-1).item())
+            ig = IntegratedGradients(model)
+            attributions, delta = ig.attribute(
+                inputs["pixel_values"],
                 target=target,
+                internal_batch_size=4,
                 return_convergence_delta=True,
             )
-            attr = attributions.sum(dim=-1).squeeze(0).detach().cpu().numpy()
-            preview = attr[: min(64, len(attr))]
+            # Keep the signed attribution in the artifact; normalize only its preview.
+            signed = attributions[0].detach().cpu().numpy().sum(axis=0)
+            preview = signed - signed.min()
+            if preview.max() > 0:
+                preview = preview / preview.max()
+            preview = preview[:: max(1, preview.shape[0] // 16), :: max(1, preview.shape[1] // 16)]
             return AnalyzerOutput(
-                summary={"target": target, "length": int(attr.shape[0]), "attribution_preview": preview.tolist()},
-                arrays={"attribution": attr.astype(np.float32)},
+                summary={
+                    "target": target,
+                    "shape": list(signed.shape),
+                    "heatmap_preview": preview.tolist(),
+                    "baseline": "zero in normalized image space",
+                    "convergence_delta": float(delta.detach().cpu().abs().max()),
+                    "preview_normalization": "min-max; raw signed sums stored separately",
+                },
+                arrays={"attribution": signed.astype(np.float32)},
             )
 
-        # text_lm: use last token logit
-        target = int(outputs.logits[:, -1, :].argmax(dim=-1).item())
-        embed = model.get_input_embeddings()
+        is_lm = context.task_type == "text_lm"
+        logits = context.outputs.logits[:, -1, :] if is_lm else context.outputs.logits
+        target = int(logits.argmax(dim=-1).item())
 
         def forward_fn(input_ids, attention_mask):
-            out = model(input_ids=input_ids, attention_mask=attention_mask)
-            return out.logits[:, -1, :]
+            output = model(input_ids=input_ids, attention_mask=attention_mask)
+            return output.logits[:, -1, :] if is_lm else output.logits
 
-        lig = LayerIntegratedGradients(forward_fn, embed)
-        attributions, _ = lig.attribute(
+        lig = LayerIntegratedGradients(forward_fn, model.get_input_embeddings())
+        attributions, delta = lig.attribute(
             inputs["input_ids"],
             additional_forward_args=(inputs.get("attention_mask"),),
             target=target,
+            internal_batch_size=4,
             return_convergence_delta=True,
         )
-        attr = attributions.sum(dim=-1).squeeze(0).detach().cpu().numpy()
-        preview = attr[: min(64, len(attr))]
+        attribution = attributions.sum(dim=-1).squeeze(0).detach().cpu().numpy()
         return AnalyzerOutput(
-            summary={"target": target, "length": int(attr.shape[0]), "attribution_preview": preview.tolist()},
-            arrays={"attribution": attr.astype(np.float32)},
+            summary={
+                "target": target,
+                "length": len(attribution),
+                "attribution_preview": attribution[:64].tolist(),
+                "baseline": "token ID zero (not a neutral-text guarantee)",
+                "convergence_delta": float(delta.detach().cpu().abs().max()),
+            },
+            arrays={"attribution": attribution.astype(np.float32)},
         )
